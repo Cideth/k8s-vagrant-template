@@ -1,0 +1,106 @@
+Vagrant.configure("2") do |config|
+    # VM 부팅 타임아웃 설정 (600초)
+    config.vm.boot_timeout = 600
+    
+    # VMware 데스크탑 제공자 설정
+    # VMware Fusion 제공자 설정으로 변경
+    config.vm.provider "vmware_fusion" do |v|
+        v.memory = 2048
+        v.cpus = 2
+        v.gui = true
+        v.linked_clone = false
+        v.port_forward_network_pause = 120
+    end
+
+    # 공통 도구 설치 쉘 스크립트 프로비저닝 (관리자 권한)
+    config.vm.provision "shell", "privileged": true, inline: $install_common_tools
+    
+    # 컨트롤 플레인 VM 정의
+    config.vm.define :controlplane do |controlplane|
+        controlplane.vm.box = "starboard/ubuntu-arm64-20.04.5"  # 베이스 박스 설정
+        controlplane.vm.hostname = "controlplane"  # 호스트 이름 설정
+        controlplane.vm.network "private_network", ip: "10.0.0.10"  # 프라이빗 네트워크 IP 설정
+        # 컨트롤 플레인 노드 프로비저닝 쉘 스크립트 (관리자 권한 아님)
+        controlplane.vm.provision "shell", "privileged": false, inline: $provision_controlplane_node
+    end
+
+    # 워커 노드 정의 (worker1, worker2)
+    %w{worker1 worker2}.each_with_index do |name, i|
+        config.vm.define name do |worker|
+            worker.vm.box = "starboard/ubuntu-arm64-20.04.5"  # 베이스 박스 설정
+            worker.vm.hostname = name  # 호스트 이름 설정
+            worker.vm.network "private_network", ip: "10.0.0.#{i + 11}"  # 프라이빗 네트워크 IP 설정
+            # 워커 노드 프로비저닝 쉘 스크립트 (관리자 권한 아님)
+            worker.vm.provision "shell", "privileged": false, inline: <<-SHELL
+  sudo /vagrant/join.sh
+  echo 'Environment="KUBELET_EXTRA_ARGS=--node-ip=10.0.0.#{i + 11}"' | sudo tee -a /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+  sudo systemctl daemon-reload
+  sudo systemctl restart kubelet
+  SHELL
+        end
+    end
+
+    # 멀티캐스트 설치 쉘 스크립트 프로비저닝
+    config.vm.provision "shell", inline: $install_multicast
+end
+
+
+# 공통 도구 설치 스크립트
+$install_common_tools = <<-SCRIPT
+# kube-router를 위한 브릿지 트래픽을 iptables로 활성화
+
+cat >> /etc/ufw/sysctl.conf <<EOF
+net/bridge/bridge-nf-call-ip6tables = 1
+net/bridge/bridge-nf-call-iptables = 1
+net/bridge/bridge-nf-call-arptables = 1
+EOF
+
+# 스왑 비활성화
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+
+# kubeadm, kubectl, kubelet 설치
+export DEBIAN_FRONTEND=noninteractive
+apt-get -qq install ebtables ethtool
+apt-get -qq update
+apt-get -qq install -y docker.io apt-transport-https curl
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+cat <<EOF >/etc/apt/sources.list.d/kubernetes.list
+deb http://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+apt-get -qq update
+apt-get -qq install -y kubelet kubeadm kubectl
+SCRIPT
+
+# 컨트롤 플레인 노드 프로비저닝 스크립트
+$provision_controlplane_node = <<-SHELL
+OUTPUT_FILE=/vagrant/join.sh
+rm -rf $OUTPUT_FILE
+
+# 클러스터 시작
+sudo kubeadm init --apiserver-advertise-address=10.0.0.10 --pod-network-cidr=10.244.0.0/16 | grep "kubeadm join" > ${OUTPUT_FILE}
+echo "--discovery-token-unsafe-skip-ca-verification" >> ${OUTPUT_FILE}
+chmod +x $OUTPUT_FILE
+
+# kubectl 설정
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# kubelet IP 수정
+echo 'Environment="KUBELET_EXTRA_ARGS=--node-ip=10.0.0.10"' | sudo tee -a /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+# flannel 설정
+curl -o kube-flannel.yml https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+sed -i.bak 's|"/opt/bin/flanneld",|"/opt/bin/flanneld", "--iface=enp0s8",|' kube-flannel.yml
+kubectl create -f kube-flannel.yml
+
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+SHELL
+
+# 멀티캐스트 설치 스크립트
+$install_multicast = <<-SHELL
+apt-get update
+apt-get install -y avahi-daemon avahi-utils --fix-missing
+SHELL
